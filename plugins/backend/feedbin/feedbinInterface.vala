@@ -13,6 +13,8 @@
 //	You should have received a copy of the GNU General Public License
 //	along with FeedReader.  If not, see <http://www.gnu.org/licenses/>.
 
+using Gee;
+
 public class FeedReader.FeedbinInterface : Peas.ExtensionBase, FeedServerInterface {
 
 	private FeedbinAPI m_api;
@@ -228,10 +230,18 @@ public class FeedReader.FeedbinInterface : Peas.ExtensionBase, FeedServerInterfa
 	{
 		try
 		{
-			if(m_api.login())
-				return LoginResponse.SUCCESS;
-			else
-				return LoginResponse.WRONG_LOGIN;
+			var future = m_api.login();
+			try
+			{
+				if(future.wait())
+					return LoginResponse.SUCCESS;
+				else
+					return LoginResponse.WRONG_LOGIN;
+			}
+			catch(FutureError.EXCEPTION e)
+			{
+				throw future.exception;
+			}
 		}
 		catch(FeedbinError.NO_CONNECTION e)
 		{
@@ -260,7 +270,7 @@ public class FeedReader.FeedbinInterface : Peas.ExtensionBase, FeedServerInterfa
 		var entry_ids = ListUtils.single<int64?>(entry_id);
 		try
 		{
-			m_api.set_entries_read(entry_ids, status == ArticleStatus.READ);
+			m_api.set_entries_read(entry_ids, status == ArticleStatus.READ).wait();
 		}
 		catch(Error e)
 		{
@@ -274,7 +284,7 @@ public class FeedReader.FeedbinInterface : Peas.ExtensionBase, FeedServerInterfa
 		var entry_ids = ListUtils.single<int64?>(entry_id);
 		try
 		{
-			m_api.set_entries_starred(entry_ids, status == ArticleStatus.MARKED);
+			m_api.set_entries_starred(entry_ids, status == ArticleStatus.MARKED).wait();
 		}
 		catch(Error e)
 		{
@@ -284,25 +294,27 @@ public class FeedReader.FeedbinInterface : Peas.ExtensionBase, FeedServerInterfa
 
 	private void setRead(string id, FeedListType type)
 	{
-		const int count = 1000;
-		int num_articles = 1; // set to any value > 0
-		for(var offset = 0; num_articles > 0; offset += count)
+		try
 		{
-			var articles = DataBase.readOnly().read_articles(id, type, ArticleListState.ALL, "", count, offset);
-			var entry_ids = new Gee.ArrayList<int64?>();
-			foreach(var article in articles)
+			const int count = 1000;
+			int num_articles = 1; // set to any value > 0
+			var futures = new ArrayList<Future<bool>>();
+			for(var offset = 0; num_articles > 0; offset += count)
 			{
-				entry_ids.add(int64.parse(article.getArticleID()));
+				var articles = DataBase.readOnly().read_articles(id, type, ArticleListState.ALL, "", count, offset);
+				var entry_ids = new Gee.ArrayList<int64?>();
+				foreach(var article in articles)
+				{
+					entry_ids.add(int64.parse(article.getArticleID()));
+				}
+				futures.add(m_api.set_entries_read(entry_ids, true));
 			}
-			try
-			{
-				m_api.set_entries_read(entry_ids, true);
-			}
-			catch(Error e)
-			{
-				Logger.error(@"FeedbinInterface.setRead: " + e.message);
-				break;
-			}
+			foreach(var future in futures)
+				future.wait();
+		}
+		catch(Error e)
+		{
+			Logger.error(@"FeedbinInterface.setRead: " + e.message);
 		}
 	}
 
@@ -350,11 +362,11 @@ public class FeedReader.FeedbinInterface : Peas.ExtensionBase, FeedServerInterfa
 	{
 		try
 		{
-			var subscription = m_api.add_subscription(feed_url);
+			var subscription = m_api.add_subscription(feed_url).wait();
 			feed_id = subscription.feed_id.to_string();
 
 			if(category_name != null)
-				m_api.add_tagging(subscription.feed_id, category_name);
+				m_api.add_tagging(subscription.feed_id, category_name).wait();
 
 			errmsg = "";
 			return true;
@@ -373,24 +385,29 @@ public class FeedReader.FeedbinInterface : Peas.ExtensionBase, FeedServerInterfa
 		return;
 	}
 
-	private FeedbinAPI.Subscription subscription_for_feed(string feed_id_str) throws FeedbinError
+	private Future<FeedbinAPI.Subscription?> subscription_for_feed(string feed_id_str)
 	{
 		var feed_id = int64.parse(feed_id_str);
-		var subscriptions = m_api.get_subscriptions();
-		foreach(var subscription in subscriptions)
-		{
-			if(subscription.feed_id == feed_id)
-				return subscription;
-		}
-		throw new FeedbinError.NOT_FOUND("No subscription found for feed $feed_id");
+		var f1 = m_api.get_subscriptions();
+		return f1.map<FeedbinAPI.Subscription?>(subscriptions => {
+			foreach(var subscription in subscriptions)
+			{
+				if(subscription.feed_id == feed_id)
+					return subscription;
+			}
+			throw new FeedbinError.NOT_FOUND("No subscription found for feed $feed_id");
+		});
 	}
 
 	public void removeFeed(string feed_id_str)
 	{
 		try
 		{
-			var subscription = subscription_for_feed(feed_id_str);
-			m_api.delete_subscription(subscription.id);
+			var f1 = subscription_for_feed(feed_id_str);
+			var f2 = f1.flat_map<bool>(subscription => {
+				return m_api.delete_subscription(subscription.id);
+			});
+			f2.wait();
 		}
 		catch(Error e)
 		{
@@ -402,8 +419,11 @@ public class FeedReader.FeedbinInterface : Peas.ExtensionBase, FeedServerInterfa
 	{
 		try
 		{
-			var subscription = subscription_for_feed(feed_id_str);
-			m_api.rename_subscription(subscription.id, title);
+			var f1 = subscription_for_feed(feed_id_str);
+			var f2 = f1.flat_map<bool>(subscription => {
+				return m_api.rename_subscription(subscription.id, title);
+			});
+			f2.wait();
 		}
 		catch(Error e)
 		{
@@ -416,22 +436,32 @@ public class FeedReader.FeedbinInterface : Peas.ExtensionBase, FeedServerInterfa
 		Logger.debug(@"moveFeed: $feed_id_str from $old_category to $new_category");
 		try
 		{
-			var subscription = subscription_for_feed(feed_id_str);
+			var subscription = subscription_for_feed(feed_id_str).wait();
 			var feed_id = subscription.feed_id;
+
+			var futures = new Gee.ArrayList<Future<bool>>();
+			Logger.debug(@"moveFeed: Adding tag $new_category to $feed_id");
+			futures.add(m_api.add_tagging(feed_id, new_category));
+
 			if(old_category != null)
 			{
-				var taggings = m_api.get_taggings();
-				foreach(var tagging in taggings)
-				{
-					if(tagging.name != old_category || tagging.feed_id != feed_id)
-						continue;
-					Logger.debug(@"moveFeed: Deleting tag $old_category from $feed_id");
-					m_api.delete_tagging(tagging.id);
-					break;
-				}
+				var f1 = m_api.get_taggings();
+				var f2 = f1.map<bool>(taggings => {
+					foreach(var tagging in taggings)
+					{
+						if(tagging.name != old_category || tagging.feed_id != feed_id)
+							continue;
+						Logger.debug(@"moveFeed: Deleting tag $old_category from $feed_id");
+						futures.add(m_api.delete_tagging(tagging.id));
+						break;
+					}
+					return true;
+				});
+				futures.add(f2);
 			}
-			Logger.debug(@"moveFeed: Adding tag $new_category to $feed_id");
-			m_api.add_tagging(feed_id, new_category);
+
+			foreach(var future in futures)
+				future.wait();
 		}
 		catch(Error e)
 		{
@@ -444,16 +474,20 @@ public class FeedReader.FeedbinInterface : Peas.ExtensionBase, FeedServerInterfa
 		Logger.debug(@"renameCategory: From $old_category to $new_category");
 		try
 		{
-			var taggings = m_api.get_taggings();
+			var taggings = m_api.get_taggings().wait();
+
+			var futures = new Gee.ArrayList<Future<bool>>();
 			foreach(var tagging in taggings)
 			{
 				if(tagging.name != old_category)
 					continue;
 				var feed_id = tagging.feed_id;
 				Logger.debug(@"renameCategory: Tagging $feed_id with $new_category");
-				m_api.delete_tagging(tagging.id);
-				m_api.add_tagging(feed_id, new_category);
+				futures.add(m_api.delete_tagging(tagging.id));
+				futures.add(m_api.add_tagging(feed_id, new_category));
 			}
+			foreach(var future in futures)
+				future.wait();
 		}
 		catch(Error e)
 		{
@@ -479,15 +513,18 @@ public class FeedReader.FeedbinInterface : Peas.ExtensionBase, FeedServerInterfa
 		Logger.debug(@"deleteCategory: $category");
 		try
 		{
-			var taggings = m_api.get_taggings();
+			var taggings = m_api.get_taggings().wait();
+			var futures = new Gee.ArrayList<Future<bool>>();
 			foreach(var tagging in taggings)
 			{
 				if(tagging.name != category)
 					continue;
 				var feed_id = tagging.feed_id;
 				Logger.debug(@"deleteCategory: Deleting category $category from feed $feed_id");
-				m_api.delete_tagging(tagging.id);
+				futures.add(m_api.delete_tagging(tagging.id));
 			}
+			foreach(var future in futures)
+				future.wait();
 		}
 		catch(Error e)
 		{
@@ -501,14 +538,14 @@ public class FeedReader.FeedbinInterface : Peas.ExtensionBase, FeedServerInterfa
 		try
 		{
 			var feed_id = int64.parse(feed_id_str);
-			var taggings = m_api.get_taggings();
+			var taggings = m_api.get_taggings().wait();
 			foreach(var tagging in taggings)
 			{
 				if(tagging.feed_id != feed_id || tagging.name != category)
 					continue;
 
 				Logger.debug(@"removeCatFromFeed: Deleting category $category from feed $feed_id");
-				m_api.delete_tagging(tagging.id);
+				m_api.delete_tagging(tagging.id).wait();
 				break;
 			}
 		}
@@ -526,11 +563,14 @@ public class FeedReader.FeedbinInterface : Peas.ExtensionBase, FeedServerInterfa
 	{
 		try
 		{
-			var taggings = m_api.get_taggings();
-			if(cancellable != null && cancellable.is_cancelled())
-				return false;
+			var tagging_future = m_api.get_taggings();
+			var favicons_future = m_api.get_favicons();
+			var subscriptions_future = m_api.get_subscriptions();
 
-			var favicons = m_api.get_favicons();
+			var taggings = tagging_future.wait();
+			var favicons = favicons_future.wait();
+			var subscriptions = subscriptions_future.wait();
+
 			if(cancellable != null && cancellable.is_cancelled())
 				return false;
 
@@ -567,7 +607,6 @@ public class FeedReader.FeedbinInterface : Peas.ExtensionBase, FeedServerInterfa
 				tag_map.set(tagging.feed_id.to_string(), tagging.name);
 			}
 
-			var subscriptions = m_api.get_subscriptions();
 			feeds.clear();
 
 			foreach(var subscription in subscriptions)
@@ -619,7 +658,7 @@ public class FeedReader.FeedbinInterface : Peas.ExtensionBase, FeedServerInterfa
 	{
 		try
 		{
-			return m_api.get_unread_entries().size;
+			return m_api.get_unread_entries().wait().size;
 		}
 		catch(Error e)
 		{
@@ -637,16 +676,16 @@ public class FeedReader.FeedbinInterface : Peas.ExtensionBase, FeedServerInterfa
 				feed_id = int64.parse(feed_id_str);
 			bool only_starred = what_to_get == ArticleStatus.MARKED;
 
-			if(cancellable != null && cancellable.is_cancelled())
-				return;
-
 			// The Feedbin API doesn't include read/unread/starred status in the entries.json
 			// so look them up.
-			var unread_ids = m_api.get_unread_entries();
+			var unread_ids_future = m_api.get_unread_entries();
+			var starred_ids_future = m_api.get_starred_entries();
+
+			var unread_ids = unread_ids_future.wait();
+			var starred_ids = starred_ids_future.wait();
+
 			if(cancellable != null && cancellable.is_cancelled())
 				return;
-
-			var starred_ids = m_api.get_starred_entries();
 
 			{
 				// Update read/unread status of existing entries
@@ -704,7 +743,7 @@ public class FeedReader.FeedbinInterface : Peas.ExtensionBase, FeedServerInterfa
 				if(cancellable != null && cancellable.is_cancelled())
 					return;
 
-				var entries = m_api.get_entries(page, only_starred, since, feed_id);
+				var entries = m_api.get_entries(page, only_starred, since, feed_id).wait();
 				if(entries.size == 0)
 					break;
 

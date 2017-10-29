@@ -4,7 +4,7 @@ const string password_env = "FEEDBIN_TEST_PASSWORD";
 
 void delete_subscription(FeedbinAPI api, string url)
 {
-    var subscriptions = api.get_subscriptions();
+    var subscriptions = api.get_subscriptions().wait();
     foreach(var subscription in subscriptions)
     {
         if(subscription.feed_url != url)
@@ -28,16 +28,16 @@ void add_login_tests(string host)
     Test.add_data_func ("/feedbinapi/login", () => {
 
         var api = new FeedbinAPI(username, password, null, host);
-        assert(api.login());
+        assert(api.login().wait());
 
         api = new FeedbinAPI("wrong", "password", null, host);
-        assert(!api.login());
+        assert(!api.login().wait());
 
         api.username = username;
-        assert(!api.login());
+        assert(!api.login().wait());
 
         api.password = password;
-        assert(api.login());
+        assert(api.login().wait());
     });
 
     Test.add_data_func ("/feedbinapi/subscription", () => {
@@ -52,16 +52,16 @@ void add_login_tests(string host)
         var url = "https://www.brendanlong.com/feeds/all.atom.xml?feedreader-test-subscribe-$nonce";
         delete_subscription(api, url);
 
-        var subscription = api.add_subscription(url);
+        var subscription = api.add_subscription(url).wait();
         assert(subscription.id != 0);
 
 		{
-			var got_subscription = api.get_subscription(subscription.id);
+			var got_subscription = api.get_subscription(subscription.id).wait();
 			assert(got_subscription.id == subscription.id);
 		}
 
         bool found_subscription = false;
-        foreach(var got_subscription in api.get_subscriptions())
+        foreach(var got_subscription in api.get_subscriptions().wait())
         {
             if(got_subscription.id == subscription.id)
             {
@@ -75,12 +75,12 @@ void add_login_tests(string host)
         assert(found_subscription);
 
         string title = "Rename test";
-        api.rename_subscription(subscription.id, title);
-        var renamed_subscription = api.get_subscription(subscription.id);
+        api.rename_subscription(subscription.id, title).wait();
+        var renamed_subscription = api.get_subscription(subscription.id).wait();
         assert(renamed_subscription.title == title);
 
-        api.delete_subscription(subscription.id);
-        foreach(var got_subscription in api.get_subscriptions())
+        api.delete_subscription(subscription.id).wait();
+        foreach(var got_subscription in api.get_subscriptions().wait())
         {
             assert(got_subscription.id != subscription.id);
             assert(got_subscription.feed_url != url);
@@ -99,21 +99,21 @@ void add_login_tests(string host)
         var url = @"https://www.brendanlong.com/feeds/all.atom.xml?feedreader-test-taggings-$nonce";
         delete_subscription(api, url);
 
-        var subscription = api.add_subscription(url);
+        var subscription = api.add_subscription(url).wait();
 
         // The subscription is new so it shouldn't have any taggings
-        var taggings = api.get_taggings();
+        var taggings = api.get_taggings().wait();
         foreach(var tagging in taggings)
         {
             assert(tagging.feed_id != subscription.feed_id);
         }
 
         string category = "Taggings Test";
-        api.add_tagging(subscription.feed_id, category);
+        api.add_tagging(subscription.feed_id, category).wait();
 
         // Check taggings
         int64? tagging_id = null;
-        foreach(var tagging in api.get_taggings())
+        foreach(var tagging in api.get_taggings().wait())
         {
             if(tagging.feed_id == subscription.feed_id)
             {
@@ -125,14 +125,14 @@ void add_login_tests(string host)
         assert(tagging_id != null);
 
         // Delete the tag and verify that it's gone
-        api.delete_tagging(tagging_id);
-        foreach(var tagging in api.get_taggings())
+        api.delete_tagging(tagging_id).wait();
+        foreach(var tagging in api.get_taggings().wait())
         {
             assert(tagging.feed_id != subscription.feed_id);
 		}
 
 		// cleanup
-		api.delete_subscription(subscription.id);
+		api.delete_subscription(subscription.id).wait();
     });
 
     Test.add_data_func ("/feedbinapi/entries", () => {
@@ -147,7 +147,7 @@ void add_login_tests(string host)
 		// Note: This one shouldn't be deleted or recreated, since we want the entries to be available
         var url = "https://www.brendanlong.com/feeds/all.atom.xml?feed-reader-test-entries";
 
-        var subscription = api.add_subscription(url);
+        var subscription = api.add_subscription(url).wait();
 
         /* FIXME: Figure out why this next line is failing
         var entries = api.get_entries(1, false, null, subscription.feed_id);
@@ -219,8 +219,8 @@ void add_login_tests(string host)
 		// Note: This one shouldn't be deleted or recreated, since we want the entries to be available
         var url = "https://www.brendanlong.com/feeds/all.atom.xml?feed-reader-test-favicons";
 
-		var subscription = api.add_subscription(url);
-		var favicons = api.get_favicons();
+		var subscription = api.add_subscription(url).wait();
+		var favicons = api.get_favicons().wait();
 		bool found_favicon = false;
 		foreach(var i in favicons.entries)
 		{
@@ -253,7 +253,7 @@ void main(string[] args)
     Test.add_data_func ("/feedbinapi/bad login", () => {
         var api = new FeedbinAPI("user", "password", null, host);
 
-        assert(!api.login());
+        assert(!api.login().wait());
     });
 
     add_login_tests(host);

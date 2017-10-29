@@ -13,6 +13,8 @@
 //	You should have received a copy of the GNU General Public License
 //	along with FeedReader.  If not, see <http://www.gnu.org/licenses/>.
 
+using Gee;
+
 // TODO: Make a general-purpose HttpClient module with these errors
 public errordomain FeedbinError {
 	INVALID_FORMAT,
@@ -37,6 +39,7 @@ public class FeedbinAPI : Object {
 		this.password = password;
 		m_base_uri = BASE_URI_FORMAT.printf(host);
 		m_session = new Soup.Session();
+		m_session.use_thread_context = true;
 
 		if(user_agent != null)
 			m_session.user_agent = user_agent;
@@ -55,7 +58,7 @@ public class FeedbinAPI : Object {
 			auth.authenticate(this.username, this.password);
 	}
 
-	private Soup.Message request(string method, string path, string? input = null) throws FeedbinError
+	private Future<Soup.Message> request(string method, string path, string? input = null, Cancellable? cancellable = null)
 	{
 		var message = new Soup.Message(method, m_base_uri + path);
 
@@ -65,26 +68,48 @@ public class FeedbinAPI : Object {
 		if(input != null)
 			message.request_body.append_take(input.data);
 
-		m_session.send_message(message);
-		var status = message.status_code;
-		if(status < 200 || status >= 400)
-		{
-			switch(status)
+		var promise = new Promise<Soup.Message>();
+		var thread = new Thread<void*>(null, () => {
+			var context = new MainContext();
+			context.push_thread_default();
+			assert(context.is_owner());
+			context.release();
+			assert(!context.is_owner());
+
+			m_session.send_message(message);
+			var status = message.status_code;
+			if(status < 200 || status >= 400)
 			{
-			case Soup.Status.CANT_RESOLVE:
-			case Soup.Status.CANT_RESOLVE_PROXY:
-			case Soup.Status.CANT_CONNECT:
-			case Soup.Status.CANT_CONNECT_PROXY:
-				throw new FeedbinError.NO_CONNECTION(@"Connection to $m_base_uri failed");
-			case Soup.Status.UNAUTHORIZED:
-				throw new FeedbinError.NOT_AUTHORIZED(@"Not authorized to $method $path");
-			case Soup.Status.NOT_FOUND:
-				throw new FeedbinError.NOT_FOUND(@"$method $path not found");
+				FeedbinError e;
+				switch(status)
+				{
+				case Soup.Status.CANT_RESOLVE:
+				case Soup.Status.CANT_RESOLVE_PROXY:
+				case Soup.Status.CANT_CONNECT:
+				case Soup.Status.CANT_CONNECT_PROXY:
+					e = new FeedbinError.NO_CONNECTION(@"Connection to $m_base_uri failed");
+					break;
+				case Soup.Status.UNAUTHORIZED:
+					e = new FeedbinError.NOT_AUTHORIZED(@"Not authorized to $method $path");
+					break;
+				case Soup.Status.NOT_FOUND:
+					e = new FeedbinError.NOT_FOUND(@"$method $path not found");
+					break;
+				default:
+					string phrase = Soup.Status.get_phrase(status);
+					e = new FeedbinError.UNKNOWN_ERROR(@"Unexpected status $status ($phrase) for $method $path");
+					break;
+				}
+				promise.set_exception(e);
 			}
-			string phrase = Soup.Status.get_phrase(status);
-			throw new FeedbinError.UNKNOWN_ERROR(@"Unexpected status $status ($phrase) for $method $path");
-		}
-		return message;
+			else
+			{
+				promise.set_value(message);
+			}
+			context.pop_thread_default();
+			return null;
+		});
+		return promise.future;
 	}
 
 	// TODO: Move to DateUtils
@@ -103,19 +128,19 @@ public class FeedbinAPI : Object {
 		return string_to_datetime(s);
 	}
 
-	private Soup.Message post_request(string path, string input) throws FeedbinError
+	private Future<Soup.Message> post_request(string path, string input, Cancellable? cancellable = null)
 	{
-		return request("POST", path, input);
+		return request("POST", path, input, cancellable);
 	}
 
-	private Soup.Message delete_request(string path, string? input = null) throws FeedbinError
+	private Future<Soup.Message> delete_request(string path, string? input = null, Cancellable? cancellable = null)
 	{
-		return request("DELETE", path, input);
+		return request("DELETE", path, input, cancellable);
 	}
 
-	private Soup.Message get_request(string path) throws FeedbinError
+	private Future<Soup.Message> get_request(string path, Cancellable? cancellable = null)
 	{
-		return request("GET", path);
+		return request("GET", path, null, cancellable);
 	}
 
 	private static Json.Node parse_json(Soup.Message response) throws FeedbinError
@@ -140,13 +165,13 @@ public class FeedbinAPI : Object {
 		return parser.get_root();
 	}
 
-	private Json.Node get_json(string path) throws FeedbinError
+	private Future<Json.Node> get_json(string path, Cancellable? cancellable = null)
 	{
-		var response = get_request(path);
-		return parse_json(response);
+		return get_request(path, cancellable)
+			.map((Future.MapFunc<Json.Node, Soup.Message>)parse_json);
 	}
 
-	private Soup.Message post_json_object(string path, Json.Object obj) throws FeedbinError
+	private Future<Soup.Message> post_json_object(string path, Json.Object obj)
 	{
 		var root = new Json.Node(Json.NodeType.OBJECT);
 		root.set_object(obj);
@@ -158,17 +183,48 @@ public class FeedbinAPI : Object {
 		return post_request(path, data);
 	}
 
-	public bool login() throws FeedbinError
+	[CCode (has_target = false)]
+	private delegate O MapExceptionFunc<O>(Error e) throws Error;
+
+	private static Future<T> map_error<T>(Future<T> input, MapExceptionFunc<T> func)
 	{
-		try
-		{
-			var res = get_request("authentication.json");
-			return res.status_code == Soup.Status.OK;
-		}
-		catch(FeedbinError.NOT_AUTHORIZED e)
-		{
-			return false;
-		}
+		var output = new Promise<T>();
+		input.wait_async.begin((obj, res) => {
+			try
+			{
+				try
+				{
+					output.set_value(input.wait_async.end(res));
+				}
+				catch(FutureError.EXCEPTION e)
+				{
+					output.set_value(func(e));
+				}
+			}
+			catch(Error e)
+			{
+				output.set_exception(e);
+			}
+		});
+		return output.future;
+	}
+
+	public Future<bool> login()
+	{
+		var f1 = get_request("authentication.json");
+		var f2 = f1.map<bool>(response => {
+			return response.status_code == Soup.Status.OK;
+		});
+		return map_error<bool>(f2, (e) => {
+			try
+			{
+				throw e;
+			}
+			catch(FeedbinError.NOT_AUTHORIZED e)
+			{
+				return false;
+			}
+		});
 	}
 
 	public struct Subscription {
@@ -190,48 +246,56 @@ public class FeedbinAPI : Object {
 		}
 	}
 
-	public Subscription get_subscription(int64 subscription_id) throws FeedbinError
+	public Future<Subscription?> get_subscription(int64 subscription_id)
 	{
-		var root = get_json(@"subscriptions/$subscription_id.json");
-		return Subscription.from_json(root.get_object());
+		var f1 = get_json(@"subscriptions/$subscription_id.json");
+		return f1.map<Subscription?>(root => {
+			return Subscription.from_json(root.get_object());
+		});
 	}
 
-	public Gee.List<Subscription?> get_subscriptions() throws FeedbinError
+	public Future<Gee.List<Subscription?>> get_subscriptions()
 	{
-		var root = get_json("subscriptions.json");
-		var subscriptions = new Gee.ArrayList<Subscription?>();
-		var array = root.get_array();
-		for(var i = 0; i < array.get_length(); ++i)
-		{
-			var node = array.get_object_element(i);
-			subscriptions.add(Subscription.from_json(node));
-		}
-		return subscriptions;
+		var f1 = get_json("subscriptions.json");
+		return f1.map<Gee.List<Subscription?>>(root => {
+			var subscriptions = new Gee.ArrayList<Subscription?>();
+			var array = root.get_array();
+			for(var i = 0; i < array.get_length(); ++i)
+			{
+				var node = array.get_object_element(i);
+				subscriptions.add(Subscription.from_json(node));
+			}
+			return subscriptions;
+		});
 	}
 
-	public void delete_subscription(int64 subscription_id) throws FeedbinError
+	public Future<bool> delete_subscription(int64 subscription_id)
 	{
-		delete_request(@"subscriptions/$subscription_id.json");
+		var f1 = delete_request(@"subscriptions/$subscription_id.json");
+		return f1.map<bool>(response => true);
 	}
 
-	public Subscription add_subscription(string url) throws FeedbinError
+	public Future<Subscription?> add_subscription(string url)
 	{
 		Json.Object object = new Json.Object();
 		object.set_string_member("feed_url", url);
 
-		var response = post_json_object("subscriptions.json", object);
-		if(response.status_code == 300)
-			throw new FeedbinError.MULTIPLE_CHOICES("Site $url has multiple feeds to subscribe to");
+		var f1 = post_json_object("subscriptions.json", object);
+		return f1.map<Subscription?>(response => {
+			if(response.status_code == 300)
+				throw new FeedbinError.MULTIPLE_CHOICES("Site $url has multiple feeds to subscribe to");
 
-		var root = parse_json(response);
-		return Subscription.from_json(root.get_object());
+			var root = parse_json(response);
+			return Subscription.from_json(root.get_object());
+		});
 	}
 
-	public void rename_subscription(int64 subscription_id, string title) throws FeedbinError
+	public Future<bool> rename_subscription(int64 subscription_id, string title)
 	{
 		Json.Object object = new Json.Object();
 		object.set_string_member("title", title);
-		post_json_object(@"subscriptions/$subscription_id/update.json", object);
+		var f1 = post_json_object(@"subscriptions/$subscription_id/update.json", object);
+		return f1.map<bool>(response => { return true; });
 	}
 
 	public struct Tagging
@@ -248,32 +312,36 @@ public class FeedbinAPI : Object {
 		}
 	}
 
-	public void add_tagging(int64 feed_id, string tag_name) throws FeedbinError
+	public Future<bool> add_tagging(int64 feed_id, string tag_name)
 	{
 		Json.Object object = new Json.Object();
 		object.set_int_member("feed_id", feed_id);
 		object.set_string_member("name", tag_name);
 
-		post_json_object("taggings.json", object);
+		var f1 = post_json_object("taggings.json", object);
 		// TODO: Return id
+		return f1.map<bool>(res => { return true; });
 	}
 
-	public void delete_tagging(int64 tagging_id) throws FeedbinError
+	public Future<bool> delete_tagging(int64 tagging_id)
 	{
-		delete_request(@"taggings/$tagging_id.json");
+		var f1 = delete_request(@"taggings/$tagging_id.json");
+		return f1.map<bool>(res => { return true; });
 	}
 
-	public Gee.List<Tagging?> get_taggings() throws FeedbinError
+	public Future<Gee.List<Tagging?>> get_taggings()
 	{
-		var root = get_json("taggings.json");
-		var taggings = new Gee.ArrayList<Tagging?>();
-		var array = root.get_array();
-		for(var i = 0; i < array.get_length(); ++i)
-		{
-			var object = array.get_object_element(i);
-			taggings.add(Tagging.from_json(object));
-		}
-		return taggings;
+		var f1 = get_json("taggings.json");
+		return f1.map<Gee.List<Tagging?>>(root => {
+			var taggings = new Gee.ArrayList<Tagging?>();
+			var array = root.get_array();
+			for(var i = 0; i < array.get_length(); ++i)
+			{
+				var object = array.get_object_element(i);
+				taggings.add(Tagging.from_json(object));
+			}
+			return taggings;
+		});
 	}
 
 	public struct Entry
@@ -288,7 +356,7 @@ public class FeedbinAPI : Object {
 		DateTime published;
 		DateTime created_at;
 
-		public Entry.from_json(Json.Object object) throws FeedbinError
+		public Entry.from_json(Json.Object object)
 		{
 			id = object.get_int_member("id");
 			feed_id = object.get_int_member("feed_id");
@@ -302,7 +370,7 @@ public class FeedbinAPI : Object {
 		}
 	}
 
-	public Gee.List<Entry?> get_entries(int page, bool only_starred, DateTime? since, int64? feed_id = null) throws FeedbinError
+	public Future<Gee.List<Entry?>> get_entries(int page, bool only_starred, DateTime? since, int64? feed_id = null)
 	{
 		string starred = only_starred ? "true" : "false";
 		string path = @"entries.json?per_page=100&page=$page&starred=$starred&include_enclosure=true";
@@ -318,53 +386,58 @@ public class FeedbinAPI : Object {
 		if(feed_id != null)
 			path = @"feeds/$feed_id/$path";
 
-		Json.Node root;
-		try
-		{
-			root = get_json(path);
-		}
-		catch(FeedbinError.NOT_FOUND e)
-		{
-			return Gee.List.empty<Entry?>();
-		}
-
-		var entries = new Gee.ArrayList<Entry?>();
-		var array = root.get_array();
-		for(var i = 0; i < array.get_length(); ++i)
-		{
-			var object = array.get_object_element(i);
-			entries.add(Entry.from_json(object));
-		}
-		return entries;
+		var f1 = get_json(path);
+		var f2 = f1.map<Gee.List<Entry?>>(root => {
+			var entries = new Gee.ArrayList<Entry?>();
+			var array = root.get_array();
+			for(var i = 0; i < array.get_length(); ++i)
+			{
+				var object = array.get_object_element(i);
+				entries.add(Entry.from_json(object));
+			}
+			return entries;
+		});
+		return map_error<Gee.List<Entry?>>(f2, e => {
+			try
+			{
+				throw e;
+			}
+			catch(FeedbinError.NOT_FOUND e)
+			{
+				return Gee.List.empty<Entry?>();
+			}
+		});
 	}
 
-	private Gee.Set<int64?> get_x_entries(string path) throws FeedbinError
+	private Future<Gee.Set<int64?>> get_x_entries(string path)
 	{
-		var root = get_json(path);
-		var array = root.get_array();
-		// We have to set the hash function here manually or contains() won't
-		// work right -- presumably because it's trying to do pointer comparisons?
-		var ids = new Gee.HashSet<int64?>(
-			(n) => { return int64_hash(n); },
-			(a, b) => { return int64_equal(a, b); });
-		for(var i = 0; i < array.get_length(); ++i)
-		{
-			ids.add(array.get_int_element(i));
-		}
-		return ids;
+		var f1 = get_json(path);
+		return f1.map<Gee.Set<int64?>>(root => {
+			var array = root.get_array();
+			// We have to set the hash function here manually or contains() won't
+			// work right -- presumably because it's trying to do pointer comparisons?
+			var ids = new Gee.HashSet<int64?>(
+				(n) => { return int64_hash(n); },
+				(a, b) => { return int64_equal(a, b); });
+			for(var i = 0; i < array.get_length(); ++i)
+			{
+				ids.add(array.get_int_element(i));
+			}
+			return ids;
+		});
 	}
 
-	public Gee.Set<int64?> get_unread_entries() throws FeedbinError
+	public Future<Gee.Set<int64?>> get_unread_entries()
 	{
 		return get_x_entries("unread_entries.json");
 	}
 
-	public Gee.Set<int64?> get_starred_entries() throws FeedbinError
+	public Future<Gee.Set<int64?>> get_starred_entries()
 	{
 		return get_x_entries("starred_entries.json");
 	}
 
-	private void set_entries_status(string type, Gee.Collection<int64?> entry_ids, bool create) throws FeedbinError
+	private Future<bool> set_entries_status(string type, Gee.Collection<int64?> entry_ids, bool create)
 	{
 		Json.Array array = new Json.Array();
 		foreach(var id in entry_ids)
@@ -376,26 +449,26 @@ public class FeedbinAPI : Object {
 		object.set_array_member(type, array);
 
 		string path = create ? @"$type.json" : @"$type/delete.json";
-		post_json_object(path, object);
+		var f1 = post_json_object(path, object);
+		return f1.map<bool>(response => { return true; });
 	}
 
-	public void set_entries_read(Gee.Collection<int64?> entry_ids, bool read) throws FeedbinError
+	public Future<bool> set_entries_read(Gee.Collection<int64?> entry_ids, bool read)
 	{
-		set_entries_status("unread_entries", entry_ids, !read);
+		return set_entries_status("unread_entries", entry_ids, !read);
 	}
 
-	public void set_entries_starred(Gee.Collection<int64?> entry_ids, bool starred) throws FeedbinError
+	public Future<bool> set_entries_starred(Gee.Collection<int64?> entry_ids, bool starred)
 	{
-		set_entries_status("starred_entries", entry_ids, starred);
+		return set_entries_status("starred_entries", entry_ids, starred);
 	}
 
-	public Gee.Map<string, Bytes?> get_favicons() throws FeedbinError
+	public Future<Gee.Map<string, Bytes?>> get_favicons()
 	{
 		// The favicon API isn't public right now; make sure to handle it
 		// suddenly changing or disappearing
-		try
-		{
-			var root = get_json("favicons.json");
+		var f1 = get_json("favicons.json");
+		var f2 = f1.map<Gee.Map<string, Bytes?>>(root => {
 			if(root == null)
 				return Gee.Map.empty<string, Bytes?>();
 
@@ -417,10 +490,9 @@ public class FeedbinAPI : Object {
 				favicons.set(host, favicon);
 			}
 			return favicons;
-		}
-		catch(Error e)
-		{
+		});
+		return map_error<Gee.Map<string, Bytes?>>(f2, e => {
 			return Gee.Map.empty<string, Bytes?>();
-		}
+		});
 	}
 }
