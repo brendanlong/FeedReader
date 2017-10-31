@@ -5,9 +5,12 @@ jobs:
       # See docker/Dockerfile
       - image: feedreader/fedora-feedreader-devel
         environment:
-          ELASTICSEARCH_URL: http://127.0.0.1:9200
           # Note: The Feedbin API has to run on subdomain "api"
           FEEDBIN_TEST_HOST: http://api.x.localhost:9292
+      # See docker/Dockerfile.Feedbin
+      - image: feedreader/feedbin
+        environment:
+          ELASTICSEARCH_URL: http://127.0.0.1:9200
           POSTGRES_USERNAME: postgres
           POSTGRES_HOST: 127.0.0.1
           DATABASE_URL: postgres://postgres@127.0.0.1:5432/feedbin_db
@@ -20,17 +23,6 @@ jobs:
 
     working_directory: ~/FeedReader
     steps:
-      - run:
-          name: Setup Feedbin
-          command: cd /feedbin && rake db:setup
-      - run:
-          name: Run Feedbin background processes
-          command: cd /feedbin && bundle exec foreman start
-          background: true
-      - run:
-          name: Run Feedbin
-          command: cd /feedbin && rackup
-          background: true
       - checkout
       - run:
           name: Build

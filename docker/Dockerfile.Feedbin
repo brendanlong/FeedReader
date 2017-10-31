@@ -1,0 +1,34 @@
+FROM registry.fedoraproject.org/fedora:26
+
+RUN dnf -y install \
+	gcc \
+	gcc-c++ \
+	git \
+	libcurl-devel \
+	libxml2-devel \
+	libxslt-devel \
+	nodejs \
+	postgresql \
+	postgresql-devel \
+	redhat-rpm-config \
+	rubygems \
+	ruby-devel \
+	rubygem-bundler \
+	ImageMagick-devel \
+	opencv-devel \
+	supervisor \
+	which
+RUN gem install bundler
+
+WORKDIR /opt
+RUN git clone https://github.com/feedbin/feedbin.git
+
+WORKDIR /opt/feedbin
+RUN bundle
+
+COPY supervisord.conf supervisord.conf
+
+EXPOSE 9292
+CMD rake db:setup; \
+	psql feedbin_development -c "INSERT INTO Users(email, password_digest, plan_id, created_at, updated_at) VALUES ('ben@benubois.com', '\$2a\$10\$U3c6mupETVLQCHS3hHymFu4f.bjXcDq.0XUi15TLJ6UEuj2//nk4i', 7, NOW(), NOW())";
+	supervisord -c supervisord.conf -n
