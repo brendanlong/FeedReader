@@ -56,6 +56,7 @@ CUSTOM_VAPIS
 	${CMAKE_BINARY_DIR}/FeedReader.vapi
 	${CMAKE_BINARY_DIR}/plugins/backend/feedbin/feedbinAPI.vapi
 	${CMAKE_SOURCE_DIR}/vapi/gd-1.0.vapi
+	${CMAKE_SOURCE_DIR}/vapi/javascriptcoregtk-4.0.vapi
 	${CMAKE_SOURCE_DIR}/vapi/webkit2gtk-4.0.vapi
 )
 

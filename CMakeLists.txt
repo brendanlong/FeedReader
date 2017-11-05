@@ -28,7 +28,7 @@ find_package(Vala REQUIRED)
 include(ValaVersion)
 include(ValaPrecompile)
 include(GResource)
-ensure_vala_version("0.38" MINIMUM)
+ensure_vala_version("0.36" MINIMUM)
 
 pkg_check_modules(LIBUNITY QUIET unity)
 
@@ -190,7 +190,7 @@ OPTIONS
 	--header=FeedReader.h
 	--vapi=FeedReader.vapi
 	--enable-experimental
-	
+
 GENERATE_VAPI
 	FeedReader
 
@@ -199,6 +199,7 @@ CUSTOM_VAPIS
 	vapi/libvilistextum.vapi
 	vapi/gtkimageview.vapi
 	vapi/gd-1.0.vapi
+	vapi/javascriptcoregtk-4.0.vapi
 	vapi/sqlite3.vapi
 	vapi/webkit2gtk-4.0.vapi
 )
